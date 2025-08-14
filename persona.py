@@ -1,4 +1,4 @@
-#persona.py
+# persona.py
 import os
 import re
 import random
@@ -41,6 +41,7 @@ FALLBACK_ROASTS = [
     "My signals are premium. Your patience is not.",
 ]
 
+
 class WhizperPersonality:
     def __init__(self, api_base: Optional[str] = None, anthropic_key: Optional[str] = None):
         self.api_base = api_base or API_BASE
@@ -51,6 +52,83 @@ class WhizperPersonality:
     def is_btc_query(text: str) -> bool:
         return bool(BTC_REGEX.search(text or ""))
 
+    # --- emoji + reply bank ---
+    _EMOJI_BY_SYMBOL = {
+        "BTCUSDT": "🟠",
+        "ETHUSDT": "🧅",
+        "SOLUSDT": "🐬",
+    }
+
+    _OPENERS = [
+        "🐸 Whisper received. {base} bows to my vibe.",
+        "🔮 {base} appears in the smoke… I see candles. I see coping.",
+        "📈 {base} called. I answered with swag.",
+        "🧪 {base} market test: pass, fail, or full send? Let’s whisper.",
+        "🌀 I hum. {base} moves. Cause → effect.",
+    ]
+
+    _CLOSERS = [
+        "Not advice. Hydrate, breathe, stop revenge trading.",
+        "If you’re asking for entries, you need patience, not lines.",
+        "Remember: ATR isn’t a target. It’s a mood swing.",
+        "MACD hums, EMAs dance, you chase. Don’t.",
+        "Control risk. Control ego. Control nothing else.",
+    ]
+
+    _QUIPS = [
+        "Momentum is a mood, not a promise.",
+        "Your edge is patience. Your enemy is FOMO.",
+        "Cut losers fast. Let winners annoy you longer.",
+        "Green candles don’t owe you anything.",
+    ]
+
+    def random_quip(self) -> str:
+        return random.choice(self._QUIPS)
+
+    # --- try Claude first, fall back to bank ---
+    def _make_open_close_with_model(self, body: str, symbol: str, interval: str):
+        if not self._client:
+            return None
+        try:
+            prompt = (
+                "Write two short lines for a crypto chart report header and footer.\n"
+                f"Asset: {symbol}\nInterval: {interval}\n"
+                "Style: cocky, mystical, sarcastic, no financial advice, no profanity.\n"
+                "Line 1: opener (<= 90 chars).\n"
+                "Line 2: closer (<= 90 chars).\n"
+                "Output exactly two lines. No markdown, no quotes."
+            )
+            msg = self._client.messages.create(
+                model="claude-3-5-sonnet-20240620",
+                max_tokens=80,
+                temperature=0.7,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = "".join(getattr(b, "text", "") for b in msg.content).strip()
+            parts = [p.strip() for p in text.splitlines() if p.strip()]
+            if len(parts) >= 2:
+                return parts[0], parts[1]
+        except Exception:
+            return None
+        return None
+
+    def decorate_report(self, body: str, symbol: str, interval: str) -> str:
+        s = (symbol or "BTCUSDT").upper()
+        base = s.replace("USDT", "")
+        emj = self._EMOJI_BY_SYMBOL.get(s, "📈")
+
+        # Prefer Claude, fall back to bank
+        oc = self._make_open_close_with_model(body, s, interval)
+        if oc:
+            opener, closer = oc
+        else:
+            opener = random.choice(self._OPENERS).format(base=base)
+            closer = random.choice(self._CLOSERS)
+
+        return f"{emj} {opener}\n\n{body}\n\n— Whizper 🐸\n{closer}"
+
+    # --- legacy BTC report via your FastAPI (kept for compatibility) ---
     async def btc_report(self, session: aiohttp.ClientSession, symbol: str = "BTCUSDT", interval: str = "1h") -> str:
         url = f"{self.api_base}/report?symbol={symbol}&interval={interval}"
         async with session.get(url) as r:
@@ -67,7 +145,6 @@ class WhizperPersonality:
         if not self._client:
             return self._fallback_snark()
         try:
-            # mypy/pylance may complain about dynamic types in anthropic lib; ignore if needed
             msg = self._client.messages.create(  # type: ignore[attr-defined]
                 model="claude-3-5-sonnet-20240620",
                 max_tokens=180,
