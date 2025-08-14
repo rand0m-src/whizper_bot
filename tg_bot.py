@@ -1,10 +1,10 @@
-#tg_bot.py
+# tg_bot.py
 import os
 import logging
 import asyncio
 import math
 from typing import List, Tuple
-
+import urllib.parse
 import aiohttp
 from aiohttp import ClientConnectorError
 import pandas as pd
@@ -23,62 +23,18 @@ BINANCE_BASES = [
     "https://api.binance.us/api/v3/klines",    # fallback for U.S.
 ]
 SYMBOLS: List[Tuple[str, str]] = [
-    ("BTC", "BTCUSDT"),  # (label, api_symbol)
+    ("BTC", "BTCUSDT"),
     ("ETH", "ETHUSDT"),
-    ("SOL", "SOLUSDT")
-    ]   
+    ("SOL", "SOLUSDT"),
+]
 PERSONA = WhizperPersonality(api_base=None, anthropic_key=None)
-ALLOWED_INTERVALS: List[str] = ["1m", "5m", "15m", "1h", "4h", "1d"]
+
+# Trimmed intervals + Summary
+ALLOWED_INTERVALS: List[str] = ["1h", "4h", "1d", "summary"]
 MAX_TELEGRAM_MSG = 4096
-WAITING_FOR_CA = {}
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    if WAITING_FOR_CA.get(user_id):
-        await update.message.reply_text(
-            "What are you waiting for? 🙄 Send me the CA and I'll see what I can do..."
-        )
-        WAITING_FOR_CA[user_id] = False  # reset after prompt
-    else:
-        # normal fallback if not expecting CA
-        await update.message.reply_text("Use the menu buttons to get started.")
-
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "contract_mode":
-        WAITING_FOR_CA[query.from_user.id] = True
-        await query.message.reply_text(
-            "Contract analysis mode activated. Paste the CA below."
-        )
-    else:
-        # handle button callbacks here
-        pass
-
-def _extract_contract(s: str) -> str:
-    s = s.strip()
-    # Pull 0x... if it's embedded in a URL or sentence
-    m = re.search(r'0x[a-fA-F0-9]{40}', s)
-    if m:
-        return m.group(0)
-    # Try a loose Solana Base58 (32–44 chars, no 0/O/I/l)
-    m = re.search(r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b', s)
-    if m:
-        return m.group(0)
-    return s
-
-def _friendly_contract_error(err: Exception) -> str:
-    msg = str(err)
-    if "No pools found" in msg:
-        return "I couldn’t find a liquid pool for that contract. Make sure it’s the **token** address (not LP), on a supported chain (ETH, BSC, Base, Solana)."
-    if "suitable pool" in msg or "missing network/address" in msg:
-        return "That pool looks weird or illiquid. Try the token’s main CA, or another chain/pair."
-    if "ohlcv" in msg or "search pools" in msg:
-        return "Upstream API coughed. Try again in a bit."
-    return "Couldn’t fetch contract data. Double‑check the CA and try again."
+# New: compact mode output (snappy, alpha-leaning)
+COMPACT_MODE = True
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("chart-whisperer-tg")
@@ -92,15 +48,10 @@ def _looks_like_evm(addr: str) -> bool:
 
 def _looks_like_solana(addr: str) -> bool:
     s = (addr or "").strip()
-    # loose check; Solana base58 is usually 32–44 chars, commonly 43–44
     return 32 <= len(s) <= 44 and s.isalnum() and not s.startswith("0x")
 
 def _interval_to_gt(interval: str) -> tuple[str, int]:
-    # map our intervals -> (timeframe, aggregate)
     m = {
-        "1m": ("minute", 1),
-        "5m": ("minute", 5),
-        "15m": ("minute", 15),
         "1h": ("hour", 1),
         "4h": ("hour", 4),
         "1d": ("day", 1),
@@ -108,10 +59,6 @@ def _interval_to_gt(interval: str) -> tuple[str, int]:
     return m.get(interval, ("hour", 1))
 
 async def _gt_find_top_pool(sess: aiohttp.ClientSession, addr: str) -> tuple[str, str, str, str]:
-    """
-    Return (network_id, pool_address, base_symbol, quote_symbol) for the most liquid pool
-    that contains the token 'addr'. We use the search endpoint so user doesn't need to pick a network.
-    """
     url = f"{GT_API}/search/pools?query={addr}"
     async with sess.get(url, headers={"accept": "application/json"}) as r:
         j = await r.json()
@@ -122,11 +69,10 @@ async def _gt_find_top_pool(sess: aiohttp.ClientSession, addr: str) -> tuple[str
     if not pools:
         raise RuntimeError("No pools found for that address.")
 
-    # Try to pick by highest liquidity (reserve_in_usd)
     best = None
     best_liq = -1.0
     for item in pools:
-        attrs = item.get("attributes", {})
+        attrs = item.get("attributes", {}) or {}
         liq = float(attrs.get("reserve_in_usd") or 0.0)
         if liq > best_liq:
             best = item
@@ -135,7 +81,7 @@ async def _gt_find_top_pool(sess: aiohttp.ClientSession, addr: str) -> tuple[str
     if not best:
         raise RuntimeError("No suitable pool found.")
 
-    attrs = best.get("attributes", {})
+    attrs = best.get("attributes", {}) or {}
     relationships = best.get("relationships", {}) or {}
     base = (relationships.get("base_token", {}).get("data", {}) or {}).get("id", "")
     quote = (relationships.get("quote_token", {}).get("data", {}) or {}).get("id", "")
@@ -164,7 +110,6 @@ async def _gt_fetch_ohlcv_df(
     if not data:
         raise RuntimeError("No OHLCV returned.")
 
-    # GeckoTerminal returns seconds timestamps; build the same schema as Binance klines
     rows = []
     for cndl in data:
         ts = int(cndl.get("timestamp"))
@@ -179,7 +124,7 @@ async def _gt_fetch_ohlcv_df(
     df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","close_time"])
     return df
 
-# -------------------- data + indicators (ported from main.py, minimal edits) --------------------
+# -------------------- data + indicators --------------------
 async def fetch_klines_async(sess: aiohttp.ClientSession, symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500) -> pd.DataFrame:
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     last_err = None
@@ -188,12 +133,10 @@ async def fetch_klines_async(sess: aiohttp.ClientSession, symbol: str = "BTCUSDT
             async with sess.get(base, params=params) as r:
                 data = await r.json()
                 if r.status != 200:
-                    # if 451 (geo-block), try next base immediately
                     if r.status == 451:
                         last_err = f"{base} -> 451 (geo-block)"
                         continue
                     raise RuntimeError(f"{base} {r.status}: {str(data)[:200]}")
-            # success -> build dataframe
             cols = [
                 "open_time","open","high","low","close","volume","close_time","qav",
                 "num_trades","taker_buy_base","taker_buy_quote","ignore"
@@ -206,7 +149,6 @@ async def fetch_klines_async(sess: aiohttp.ClientSession, symbol: str = "BTCUSDT
             return df[["open_time","open","high","low","close","volume","close_time"]]
         except Exception as e:
             last_err = e
-            # try next base
             continue
     raise RuntimeError(f"All Binance bases failed: {last_err}")
 
@@ -307,17 +249,10 @@ def generate_analysis(df: pd.DataFrame) -> dict:
     if atr_val is not None:
         notes.append(f"ATR14 ≈ {atr_val:.2f}; expect ±{atr_val:.2f} range")
 
-    # --- VWAP ---
     vwap_val = float(last["vwap"]) if not math.isnan(last["vwap"]) else None
     vwap_delta = None
     if vwap_val is not None:
         vwap_delta = (price - vwap_val) / vwap_val * 100.0
-        if abs(vwap_delta) < 0.15:
-            notes.append(f"Price at VWAP ({vwap_delta:+.2f}%)")
-        elif vwap_delta > 0:
-            notes.append(f"Price above VWAP ({vwap_delta:+.2f}%)")
-        else:
-            notes.append(f"Price below VWAP ({vwap_delta:+.2f}%)")
 
     return {
         "price": price,
@@ -348,7 +283,61 @@ def risk_badge(atr: float | None, price: float | None) -> str:
         label = "🔷🔷 High"
     return f"{label} ({pct:.2f}%)"
 
-def build_summary(symbol: str, interval: str, r: dict) -> str:
+# ---------- Compact/alpha output helpers ----------
+def _recent_move(df: pd.DataFrame, interval: str) -> tuple[float, float, float]:
+    """
+    Returns (start, end, pct_change) over a sensible multi-day window per interval.
+    1h -> last 72h; 4h -> last 14 candles (~2–3 days); 1d -> last 7 days.
+    """
+    if df.empty:
+        return (0.0, 0.0, 0.0)
+    if interval == "1h":
+        window = min(len(df), 72)
+    elif interval == "4h":
+        window = min(len(df), 14)
+    else:
+        window = min(len(df), 7)
+    w = df.tail(window)
+    start = float(w.iloc[0]["close"])
+    end = float(w.iloc[-1]["close"])
+    pct = ((end - start) / start * 100.0) if start else 0.0
+    return (start, end, pct)
+
+def _alpha_hint(r: dict) -> str:
+    tr = r["trend"]
+    rsi_s = r["rsi_state"]
+    vwap_delta = r.get("vwap_delta")
+    notes = []
+    if tr == "bullish":
+        notes.append("Buy dips toward EMA20/50; look for MACD hold.")
+        if vwap_delta is not None and vwap_delta < 0:
+            notes.append("Below VWAP — better RR on reclaim.")
+    elif tr == "bearish":
+        notes.append("Fade rallies into EMAs; wait for MACD roll-up to flip.")
+        if rsi_s == "oversold":
+            notes.append("Oversold — bounce risk; size down.")
+    else:
+        notes.append("Range tactics; wait for EMA cross or VWAP reclaim.")
+        if rsi_s == "overbought":
+            notes.append("Overbought in range — mean reversion likely.")
+    return " ".join(notes[:1])
+
+def build_concise_report(symbol: str, interval: str, df: pd.DataFrame, r: dict) -> str:
+    trend = r["trend"].upper()
+    risk = risk_badge(r.get("atr14"), r.get("price"))
+    start, end, pct = _recent_move(df, interval)
+    header = f"{symbol} • {interval} • {trend} • Risk {risk}"
+    move = f"Move (recent): {pct:+.2f}%  ({start:,.2f} → {end:,.2f})"
+    alpha = f"Alpha: {_alpha_hint(r)}"
+    ctx_bits = []
+    if r.get("vwap_delta") is not None:
+        ctx_bits.append(f"VWAP {r['vwap_delta']:+.2f}%")
+    ctx_bits.append(f"Price ${r['price']:.2f}")
+    ctx = " | ".join(ctx_bits)
+    return "\n".join([header, move, alpha, ctx])
+
+# ---------- Legacy verbose builders (kept for fallback/toggling) ----------
+def build_summary(pair_label: str, interval: str, r: dict) -> str:
     if r["ema20"] > r["ema50"]:
         ema_rel = "EMA20>EMA50"
     elif r["ema20"] < r["ema50"]:
@@ -365,14 +354,14 @@ def build_summary(symbol: str, interval: str, r: dict) -> str:
         vwap_str = f" | VWAP {vdelta:+.2f}%"
 
     line1 = (
-        f"{symbol} {interval} — {r['trend'].title()} | RSI {r['rsi_state'].title()} | "
+        f"{pair_label} {interval} — {r['trend'].title()} | RSI {r['rsi_state'].title()} | "
         f"{ema_rel} | {macd_sig}{vwap_str} | Risk {risk} | ${r['price']:.2f}"
     )
 
     fibs = r.get("fibs") or {}
     line2 = f"Fibs: .382 {fibs['0.382']:.2f} / .618 {fibs['0.618']:.2f}" if "0.382" in fibs and "0.618" in fibs else ""
     return line1 if not line2 else f"{line1}\n{line2}"
-    
+
 def build_report(symbol: str, interval: str, result: dict) -> str:
     lines = []
     lines.append(f"Whizper_BOT — {symbol} on {interval}")
@@ -411,7 +400,28 @@ def build_report(symbol: str, interval: str, result: dict) -> str:
         lines.append(" • Range tactics; wait for EMA cross or MACD shift")
     return "\n".join(lines)
 
-# Build report end-to-end with retry (replaces old _fetch_text_report)
+# --- Symbol 24h summary (for the Summary button) ---
+async def _fetch_symbol_24h_summary(context: ContextTypes.DEFAULT_TYPE, symbol: str) -> str:
+    sess = await _ensure_session(context)
+    df = await fetch_klines_async(sess, symbol=symbol, interval="1h", limit=30)
+    if len(df) < 2:
+        return "24h summary: not enough data."
+
+    window = df.tail(24) if len(df) >= 24 else df
+    start = float(window.iloc[0]["close"])
+    end = float(window.iloc[-1]["close"])
+    change = ((end - start) / start) * 100.0 if start else 0.0
+
+    if change > 2:
+        tone = "bullish momentum; buy dips only"
+    elif change < -2:
+        tone = "heavy sellers; fade bounces"
+    else:
+        tone = "range-bound; wait for break or VWAP reclaim"
+
+    return f"24h: {change:+.2f}%  ({start:,.2f} → {end:,.2f}) — {tone}."
+
+# Build report end-to-end with retry
 async def _fetch_text_report(context: ContextTypes.DEFAULT_TYPE, symbol: str, interval: str) -> str:
     sess = await _ensure_session(context)
     last_err = None
@@ -420,12 +430,14 @@ async def _fetch_text_report(context: ContextTypes.DEFAULT_TYPE, symbol: str, in
             df = await fetch_klines_async(sess, symbol=symbol, interval=interval, limit=500)
             df = add_indicators(df)
             result = generate_analysis(df)
-            return build_report(symbol, interval, result)
+            if COMPACT_MODE:
+                return build_concise_report(symbol, interval, df, result)
+            else:
+                return build_report(symbol, interval, result)
         except (ClientConnectorError, asyncio.TimeoutError) as e:
             last_err = e
             await asyncio.sleep(0.7 * (attempt + 1))
         except Exception as e:
-            # non-network error (parse/indicator)
             raise RuntimeError(f"Report build failed: {e}") from e
     raise RuntimeError(f"Data source unreachable after retries: {last_err}")
 
@@ -454,50 +466,45 @@ def _symbol_keyboard() -> InlineKeyboardMarkup:
         ]
     ])
 
-def _interval_keyboard() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("1m", callback_data="int|1m"),
-        InlineKeyboardButton("5m", callback_data="int|5m"),
-        InlineKeyboardButton("15m", callback_data="int|15m")],
-        [InlineKeyboardButton("1h", callback_data="int|1h"),
+def interval_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("1h", callback_data="int|1h"),
         InlineKeyboardButton("4h", callback_data="int|4h"),
-        InlineKeyboardButton("1d", callback_data="int|1d")],
-        [InlineKeyboardButton("« Change Coin", callback_data="nav|symbol")]
-    ]
-    return InlineKeyboardMarkup(rows)
+        InlineKeyboardButton("1d", callback_data="int|1d"),
+        InlineKeyboardButton("Summary", callback_data="int|summary"),
+    ]])
 
 def _action_keyboard() -> InlineKeyboardMarkup:
+    # Labels nudged toward the snappier vibe; functionality unchanged
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔁 Refresh", callback_data="act|refresh")],
-        [InlineKeyboardButton("🪙 Change Coin", callback_data="nav|symbol"),
-        InlineKeyboardButton("⏱️ Change Interval", callback_data="nav|interval")]
+        [InlineKeyboardButton("🔁 Re-run", callback_data="act|refresh")],
+        [
+            InlineKeyboardButton("🪙 Change Coin", callback_data="nav|symbol"),
+            InlineKeyboardButton("⏱️ Timeframe", callback_data="nav|interval")
+        ]
+    ])
+
+def _contract_action_keyboard(dex_url: str, gt_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔗 Dexscreener", url=dex_url),
+            InlineKeyboardButton("🦎 GeckoTerminal", url=gt_url),
+        ],
+        [
+            InlineKeyboardButton("🪙 Change Coin", callback_data="nav|symbol"),
+            InlineKeyboardButton("⏱️ Timeframe", callback_data="nav|interval"),
+        ]
     ])
 
 WELCOME = (
-    "🐸 Whizper Bot — So you need help? Fine. Here's the deal..\n\n"
-    "Enter /start to wake me up:\n"
-    "Tap the shiny buttons to choose your coin & timeframe.\n"
-    "I’ll cough up my “analysis” — trend, RSI, EMAs, MACD, ATR, fib levels… and my unsolicited opinion.\n\n"
-    "⏳ Supported intervals:\n"
-    f"{', '.join(ALLOWED_INTERVALS)}\n\n"
-    "💡 I’m sarcastic, slightly rude, but sometimes useful. Think of me as your caffeinated, chart-obsessed, crypto-degen friend."
+    "🐸 Whizper Bot — I read charts so you don’t have to.\n\n"
+    "Tap /start, pick a coin and timeframe (1h/4h/1d), or hit Summary.\n"
+    "I’ll give you a tight take: **Trend**, **Risk**, **Recent Move**, and an **Alpha hint**.\n\n"
+    "⏳ Supported intervals: 1h, 4h, 1d, Summary\n"
+    "💡 I’m sarcastic, a little rude, occasionally useful."
 )
 
 # -------------------- commands --------------------
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("awaiting_contract"):
-        address = update.message.text.strip()
-        context.user_data.pop("awaiting_contract", None)
-        # Fetch contract report
-        try:
-            sess = await _ensure_session(context)
-            url = f"http://127.0.0.1:8000/contract_report?address={address}&interval=1h"
-            async with sess.get(url) as r:
-                text = await r.text()
-            await update.message.reply_text(f"📈 Whispering contract {address} on 1h:\n\n{text}")
-        except Exception as e:
-            await update.message.reply_text(f"Couldn't fetch contract report: {e}")
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     await update.message.reply_text("Wake up call received. Pick a coin:", reply_markup=_symbol_keyboard())
@@ -505,7 +512,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(WELCOME)
 
-# -------------------- callback flow --------------------
+# -------------------- callback + text flow --------------------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q:
@@ -517,7 +524,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data.pop("interval", None)
         await q.edit_message_text("Pick a coin:", reply_markup=_symbol_keyboard())
         return
-    
+
     if data == "nav|contract":
         context.user_data.clear()
         context.user_data["awaiting_contract"] = True
@@ -525,25 +532,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if data == "nav|interval":
-        await q.edit_message_text("Pick a timeframe:", reply_markup=_interval_keyboard())
+        await q.edit_message_text("Pick a timeframe:", reply_markup=interval_keyboard())
         return
 
     if data.startswith("sym|"):
         symbol = data.split("|", 1)[1]
         context.user_data["symbol"] = symbol
-        await q.edit_message_text(f"Coin locked: {symbol}\nNow pick a timeframe:", reply_markup=_interval_keyboard())
+        await q.edit_message_text(f"Coin locked: {symbol}\nNow pick a timeframe:", reply_markup=interval_keyboard())
         return
 
     if data.startswith("int|"):
         interval = data.split("|", 1)[1]
         if interval not in ALLOWED_INTERVALS:
-            await q.edit_message_text("Bad interval. Try again:", reply_markup=_interval_keyboard())
+            await q.edit_message_text("Bad interval. Try again:", reply_markup=interval_keyboard())
             return
         context.user_data["interval"] = interval
         symbol = context.user_data.get("symbol", SYMBOLS[0][1])
         try:
-            text = await _fetch_text_report(context, symbol, interval)
-            text = PERSONA.decorate_report(text, symbol, interval)
+            if interval == "summary":
+                text = await _fetch_symbol_24h_summary(context, symbol)
+                text = PERSONA.decorate_report(text, symbol, interval)
+                header = f"📈 Whispering {symbol} — 24h Summary:\n\n"
+                chunks = _chunk(header + text)
+                await q.edit_message_text(chunks[0], reply_markup=_action_keyboard())
+                for more in chunks[1:]:
+                    await q.message.reply_text(more)
+                return
+            else:
+                text = await _fetch_text_report(context, symbol, interval)
+                text = PERSONA.decorate_report(text, symbol, interval)
         except Exception as e:
             await q.edit_message_text(f"Couldn’t fetch report: {e}")
             return
@@ -558,12 +575,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         symbol = context.user_data.get("symbol", SYMBOLS[0][1])
         interval = context.user_data.get("interval", "1h")
         try:
-            text = await _fetch_text_report(context, symbol, interval)
-            text = PERSONA.decorate_report(text, symbol, interval)
+            if interval == "summary":
+                text = await _fetch_symbol_24h_summary(context, symbol)
+                text = PERSONA.decorate_report(text, symbol, interval)
+                header = f"📈 Whispering {symbol} — 24h Summary:\n\n"
+            else:
+                text = await _fetch_text_report(context, symbol, interval)
+                text = PERSONA.decorate_report(text, symbol, interval)
+                header = f"📈 Whispering {symbol} on {interval}:\n\n"
         except Exception as e:
             await q.edit_message_text(f"Couldn’t fetch report: {e}", reply_markup=_action_keyboard())
             return
-        header = f"📈 Whispering {symbol} on {interval}:\n\n"
         chunks = _chunk(header + text)
         await q.edit_message_text(chunks[0], reply_markup=_action_keyboard())
         for more in chunks[1:]:
@@ -575,39 +597,106 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = update.message.text.strip()
 
-    # Only react when user explicitly tapped "Analyze Contract"
+    # Only handle CAs when we're in contract mode
     if not context.user_data.get("awaiting_contract"):
-        # Optional: if user pasted an obvious CA without pressing the button, we could ignore.
         return
 
-    context.user_data.pop("awaiting_contract", None)
     address = _extract_contract(text)
-    interval = "1h"  # keep it simple for now
+    interval = "1h"
     sess = await _ensure_session(context)
 
     try:
+        # Try to build contract report
         net, pool, base_sym, quote_sym = await _gt_find_top_pool(sess, address)
         df = await _gt_fetch_ohlcv_df(sess, net, pool, interval, limit=200)
         df = add_indicators(df)
         r = generate_analysis(df)
-
         pair = f"{base_sym}{'/' + quote_sym if quote_sym else ''}"
-        # If you want just name/price/mcap later, we can swap to a slim summary here.
         body = build_summary(pair, interval, r)
         body = PERSONA.decorate_report(body, pair.upper(), interval)
 
+        # ✅ success: clear the mode flag
+        context.user_data.pop("awaiting_contract", None)
+
+        # 🔗 add links
+        dex_url = dexscreener_url(address, network_id=net)
+        gt_url = geckoterminal_pool_url(net, pool)
+        kb = _contract_action_keyboard(dex_url, gt_url)
+
         header = f"📈 Whispering {pair.upper()} on {interval}:\n\n"
-        for chunk in _chunk(header + body):
-            await update.message.reply_text(chunk, reply_markup=_action_keyboard())
+        for i, chunk in enumerate(_chunk(header + body)):
+            if i == 0:
+                await update.message.reply_text(chunk, reply_markup=kb)
+            else:
+                await update.message.reply_text(chunk)
 
     except Exception as e:
-        await update.message.reply_text(_friendly_contract_error(e))
+        # ❌ Error: keep the mode ON and re-prompt
+        err = _friendly_contract_error(e)
+        context.user_data["awaiting_contract"] = True
+        await update.message.reply_text(
+            f"{err}\n\nPaste another contract address (ETH/BSC/Base/SOL supported), "
+            f"or /start to exit contract mode."
+        )
+
+# -------------------- helpers for contract errors + CA extraction --------------------
+def _extract_contract(s: str) -> str:
+    s = s.strip()
+    m = re.search(r'0x[a-fA-F0-9]{40}', s)
+    if m:
+        return m.group(0)
+    m = re.search(r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b', s)
+    if m:
+        return m.group(0)
+    return s
+
+def _friendly_contract_error(err: Exception) -> str:
+    msg = str(err)
+    if "No pools found" in msg:
+        return "I couldn’t find a liquid pool for that contract. Make sure it’s the **token** address (not LP), on a supported chain (ETH, BSC, Base, Solana)."
+    if "suitable pool" in msg or "missing network/address" in msg:
+        return "That pool looks weird or illiquid. Try the token’s main CA, or another chain/pair."
+    if "ohlcv" in msg or "search pools" in msg:
+        return "Upstream API coughed. Try again in a bit."
+    return "Couldn’t fetch contract data. Double-check the CA and try again."
 
 # -------------------- lifecycle --------------------
 async def on_shutdown(app: Application) -> None:
     sess: aiohttp.ClientSession | None = app.bot_data.get("session")
     if sess and not sess.closed:
         await sess.close()
+
+# --- External links helpers ---
+def _dexscreener_chain_slug(network_id: str | None) -> str | None:
+    if not network_id:
+        return None
+    nid = network_id.lower()
+    mapping = {
+        # EVM majors
+        "eth": "ethereum", "ethereum": "ethereum",
+        "bsc": "bsc", "bnb": "bsc",
+        "base": "base",
+        "arb": "arbitrum", "arbitrum": "arbitrum",
+        "op": "optimism", "optimism": "optimism",
+        "polygon": "polygon", "matic": "polygon",
+        "avax": "avalanche", "avalanche": "avalanche",
+        "ftm": "fantom", "fantom": "fantom",
+        # Solana (+ sonic if you use it)
+        "sol": "solana", "solana": "solana",
+        "s": "sonic", "sonic": "sonic",
+    }
+    return mapping.get(nid)
+
+def dexscreener_url(address: str, network_id: str | None = None) -> str:
+    chain = _dexscreener_chain_slug(network_id)
+    if chain:
+        return f"https://dexscreener.com/{chain}/{address}"
+    # robust fallback: URL-encode the query
+    q = urllib.parse.quote_plus(address)
+    return f"https://dexscreener.com/search?q={q}"
+
+def geckoterminal_pool_url(network_id: str, pool_address: str) -> str:
+    return f"https://www.geckoterminal.com/{network_id}/pools/{pool_address}"
 
 def main() -> None:
     if not BOT_TOKEN:
