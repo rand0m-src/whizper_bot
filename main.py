@@ -18,22 +18,110 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+
+# BINANCE (free, no key)
+# BINANCE_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_BASES = [
+    "https://api.binance.com/api/v3/klines",
+    "https://api.binance.us/api/v3/klines",
+]
+
+# GeckoTerminal (free, no key)
+GT_API = "https://api.geckoterminal.com/api/v2"
 
 def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500) -> pd.DataFrame:
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(BINANCE_URL, params=params, timeout=20)
+    last_err = None
+    for url in BINANCE_BASES:
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            if r.status_code == 451:
+                last_err = "451 geo-block"
+                continue
+            r.raise_for_status()
+            data = r.json()
+            cols = ["open_time","open","high","low","close","volume","close_time","qav","num_trades","taker_buy_base","taker_buy_quote","ignore"]
+            df = pd.DataFrame(data, columns=cols)
+            for c in ["open","high","low","close","volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+            df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+            return df[["open_time","open","high","low","close","volume","close_time"]]
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"All Binance bases failed: {last_err}")
+
+def _gt_interval_map(interval: str) -> tuple[str, int]:
+    # map our intervals to GeckoTerminal timeframe/aggregate
+    m = {
+        "1m": ("minute", 1),
+        "5m": ("minute", 5),
+        "15m": ("minute", 15),
+        "1h": ("hour", 1),
+        "4h": ("hour", 4),
+        "1d": ("day", 1),
+    }
+    return m.get(interval, ("hour", 1))
+
+def _gt_find_top_pool(address: str) -> tuple[str, str, str, str]:
+    """
+    Returns (network_id, pool_address, base_symbol, quote_symbol) for the most liquid pool
+    that contains the token at 'address'. We search across networks so user needn't specify chain.
+    """
+    url = f"{GT_API}/search/pools"
+    r = requests.get(url, params={"query": address}, headers={"accept": "application/json"}, timeout=20)
     r.raise_for_status()
-    data = r.json()
-    cols = [
-        "open_time","open","high","low","close","volume","close_time","qav","num_trades","taker_buy_base","taker_buy_quote","ignore"
-    ]
-    df = pd.DataFrame(data, columns=cols)
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-    df = df[["open_time","open","high","low","close","volume","close_time"]]
+    j = r.json()
+    pools = j.get("data") or []
+    if not pools:
+        raise RuntimeError("No pools found for that address.")
+
+    best = None
+    best_liq = -1.0
+    for item in pools:
+        attrs = item.get("attributes", {})
+        liq = float(attrs.get("reserve_in_usd") or 0.0)
+        if liq > best_liq:
+            best = item
+            best_liq = liq
+
+    if not best:
+        raise RuntimeError("No suitable pool found.")
+
+    attrs = best.get("attributes", {})
+    rel = best.get("relationships", {}) or {}
+    base_sym = (attrs.get("base_token_symbol") or "TOKEN").upper()
+    quote_sym = (attrs.get("quote_token_symbol") or "USD").upper()
+    network_id = attrs.get("network_id") or ""
+    pool_addr = attrs.get("address") or ""
+    if not network_id or not pool_addr:
+        raise RuntimeError("Pool record missing network/address.")
+    return network_id, pool_addr, base_sym, quote_sym
+
+def _gt_fetch_ohlcv_df(network: str, pool: str, interval: str, limit: int = 500) -> pd.DataFrame:
+    timeframe, aggregate = _gt_interval_map(interval)
+    url = f"{GT_API}/networks/{network}/pools/{pool}/ohlcv/{timeframe}"
+    params = {"aggregate": aggregate, "limit": min(limit, 500), "currency": "usd"}
+    r = requests.get(url, params=params, headers={"accept": "application/json"}, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    data = j.get("data") or []
+    if not data:
+        raise RuntimeError("No OHLCV returned.")
+    # handle both flat and attributes-wrapped shapes
+    rows = []
+    for item in data:
+        attrs = item.get("attributes", item)
+        ts = int(attrs.get("timestamp"))
+        o = float(attrs.get("open"))
+        h = float(attrs.get("high"))
+        l = float(attrs.get("low"))
+        c = float(attrs.get("close"))
+        v = float(attrs.get("volume") or 0.0)
+        t = pd.to_datetime(ts, unit="s", utc=True)
+        rows.append([t, o, h, l, c, v, t])
+    df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","close_time"])
     return df
 
 def ema(series: pd.Series, span: int) -> pd.Series:
@@ -75,6 +163,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     window = 120
     df["swing_high"] = df["high"].rolling(window).max()
     df["swing_low"] = df["low"].rolling(window).min()
+
+    # --- VWAP (cumulative over the fetched window) ---
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    df["vwap"] = (tp * df["volume"]).cumsum() / df["volume"].cumsum()
+
     return df
 
 def fib_levels(row):
@@ -113,6 +206,7 @@ def generate_analysis(df: pd.DataFrame) -> dict:
     rsi_s = rsi_state(float(last["rsi14"]))
     fibs = fib_levels(last)
     atr_val = float(last["atr14"]) if not math.isnan(last["atr14"]) else None
+
     notes = []
     if tr == "bullish":
         notes.append("EMA20 > EMA50 and MACD momentum positive")
@@ -120,12 +214,27 @@ def generate_analysis(df: pd.DataFrame) -> dict:
         notes.append("EMA20 < EMA50 and MACD momentum negative")
     else:
         notes.append("Mixed signals; momentum unclear")
+
     if rsi_s == "overbought":
         notes.append("RSI > 70; risk of pullback")
     elif rsi_s == "oversold":
         notes.append("RSI < 30; bounce potential")
-    if atr_val:
+
+    if atr_val is not None:
         notes.append(f"ATR14 ≈ {atr_val:.2f}; expect ±{atr_val:.2f} range")
+
+    # --- VWAP ---
+    vwap_val = float(last["vwap"]) if not math.isnan(last["vwap"]) else None
+    vwap_delta = None
+    if vwap_val is not None:
+        vwap_delta = (price - vwap_val) / vwap_val * 100.0
+        if abs(vwap_delta) < 0.15:
+            notes.append(f"Price at VWAP ({vwap_delta:+.2f}%)")
+        elif vwap_delta > 0:
+            notes.append(f"Price above VWAP ({vwap_delta:+.2f}%)")
+        else:
+            notes.append(f"Price below VWAP ({vwap_delta:+.2f}%)")
+
     return {
         "price": price,
         "trend": tr,
@@ -139,7 +248,21 @@ def generate_analysis(df: pd.DataFrame) -> dict:
         "fibs": fibs,
         "notes": notes,
         "time": str(last["close_time"]),
+        "vwap": vwap_val,
+        "vwap_delta": vwap_delta,
     }
+
+def risk_badge(atr: float | None, price: float | None) -> str:
+    if not atr or not price or price <= 0:
+        return "N/A"
+    pct = atr / price * 100.0
+    if pct < 0.5:
+        label = "🔹 Low"
+    elif pct < 1.0:
+        label = "🔷 Med"
+    else:
+        label = "🔷🔷 High"
+    return f"{label} ({pct:.2f}%)"
 
 def build_report(symbol: str, interval: str, result: dict) -> str:
     lines = []
@@ -149,19 +272,32 @@ def build_report(symbol: str, interval: str, result: dict) -> str:
     lines.append(f"Price: {result['price']:.2f}")
     lines.append("")
     lines.append(f"Trend: {result['trend'].upper()}  |  RSI14: {result['rsi_state'].upper()}")
+
+    # --- VWAP display ---
+    if result.get("vwap") is not None:
+        if result.get("vwap_delta") is not None:
+            lines.append(f"VWAP: {result['vwap']:.2f}  Δ: {result['vwap_delta']:+.2f}%")
+        else:
+            lines.append(f"VWAP: {result['vwap']:.2f}")
+
     lines.append(f"EMA20: {result['ema20']:.2f}   EMA50: {result['ema50']:.2f}")
     lines.append(f"MACD: {result['macd']:.5f}  Signal: {result['macd_signal']:.5f}  Hist: {result['macd_hist']:.5f}")
+
+    # --- Risk badge on ATR line ---
     if result.get('atr14') is not None:
-        lines.append(f"ATR14: {result['atr14']:.2f} (≈ expected intrvl range)")
+        lines.append(f"ATR14: {result['atr14']:.2f} | Risk: {risk_badge(result['atr14'], result['price'])}")
+
     fibs = result.get('fibs') or {}
     if fibs:
         levels = ", ".join([f"{k}:{v:.2f}" for k, v in fibs.items()])
         lines.append(f"Fibs(120 bars): {levels}")
+
     if result.get('notes'):
         lines.append("")
         lines.append("Notes:")
         for n in result['notes']:
             lines.append(f" • {n}")
+
     lines.append("")
     lines.append("Trade Ideas (not advice):")
     if result['trend'] == 'bullish':
@@ -184,6 +320,25 @@ def analyze(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500):
     df = add_indicators(df)
     result = generate_analysis(df)
     return {"symbol": symbol, "interval": interval, "result": result}
+
+@app.get("/contract_analyze")
+def contract_analyze(address: str, interval: str = "1h", limit: int = 500):
+    net, pool, base_sym, quote_sym = _gt_find_top_pool(address)
+    df = _gt_fetch_ohlcv_df(net, pool, interval, limit)
+    df = add_indicators(df)
+    result = generate_analysis(df)
+    symbol = f"{base_sym}/{quote_sym}" if quote_sym else base_sym
+    return {"symbol": symbol, "interval": interval, "result": result, "network": net, "pool": pool}
+
+@app.get("/contract_report", response_class=PlainTextResponse)
+def contract_report(address: str, interval: str = "1h", limit: int = 500):
+    net, pool, base_sym, quote_sym = _gt_find_top_pool(address)
+    df = _gt_fetch_ohlcv_df(net, pool, interval, limit)
+    df = add_indicators(df)
+    result = generate_analysis(df)
+    symbol = f"{base_sym}/{quote_sym}" if quote_sym else base_sym
+    text = build_report(symbol, interval, result)
+    return text
 
 @app.get("/report", response_class=PlainTextResponse)
 def report(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500):
